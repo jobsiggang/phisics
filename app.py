@@ -15,6 +15,29 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0
 _latest: dict = {}
 
 
+def _decide_motors(temp: float, hum: float) -> tuple[bool, bool]:
+    # 간단한 안전 규칙: 고온이면 팬 ON, 저습이면 펌프 ON
+    fan_on = temp >= 28.0
+    pump_on = hum <= 45.0
+    return fan_on, pump_on
+
+
+def _build_fallback_result(temp: float, hum: float, reason: str) -> str:
+    fan_on, pump_on = _decide_motors(temp, hum)
+    fan = "on" if fan_on else "off"
+    pump = "on" if pump_on else "off"
+    return (
+        "Gemini 호출에 실패하여 규칙 기반 제어를 사용합니다.\n"
+        f"측정값: temperature={temp}, humidity={hum}\n"
+        f"사유: {reason}\n"
+        f"{{\"fan_motor\": \"{fan}\", \"water_pump\": \"{pump}\"}}"
+    )
+
+
+def _extract_gemini_text(result_json: dict) -> str:
+    return result_json["candidates"][0]["content"]["parts"][0]["text"]
+
+
 @app.route("/", methods=["GET"])
 def index():
     return render_template("index.html")
@@ -44,9 +67,6 @@ def health():
 @app.route("/sensor", methods=["POST"])
 def sensor():
     try:
-        if not API_KEY:
-            return jsonify({"error": "GEMINI_API_KEY is not set"}), 500
-
         data = request.get_json(force=True)
         if not data:
             return jsonify({"error": "JSON body is required"}), 400
@@ -65,24 +85,38 @@ def sensor():
             "Esp32로 제어할 수 있도록 선풍기 모터와 물펌프 모터의 상태를 JSON 형태로 알려주세요."
         )
 
-        headers = {
-            "Content-Type": "application/json",
-            "x-goog-api-key": API_KEY,
-        }
-        body = {
-            "contents": [
-                {
-                    "parts": [
-                        {"text": prompt},
+        result = ""
+        ai_error = None
+
+        if API_KEY:
+            try:
+                headers = {
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": API_KEY,
+                }
+                body = {
+                    "contents": [
+                        {
+                            "parts": [
+                                {"text": prompt},
+                            ]
+                        }
                     ]
                 }
-            ]
-        }
 
-        res = requests.post(GEMINI_URL, headers=headers, json=body, timeout=10)
-        res.raise_for_status()
-        result_json = res.json()
-        result = result_json["candidates"][0]["content"]["parts"][0]["text"]
+                res = requests.post(GEMINI_URL, headers=headers, json=body, timeout=12)
+                res.raise_for_status()
+                result_json = res.json()
+                result = _extract_gemini_text(result_json)
+            except requests.RequestException as e:
+                ai_error = f"Gemini request failed: {e}"
+            except (KeyError, IndexError, TypeError) as e:
+                ai_error = f"Invalid Gemini response: {e}"
+        else:
+            ai_error = "GEMINI_API_KEY is not set"
+
+        if not result:
+            result = _build_fallback_result(float(temp), float(hum), ai_error or "unknown")
 
         print(f"[AI 응답] {result}")
 
@@ -94,14 +128,12 @@ def sensor():
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
-        return jsonify({"result": result})
+        response = {"result": result}
+        if ai_error:
+            response["fallback"] = True
+            response["detail"] = ai_error
+        return jsonify(response)
 
-    except requests.RequestException as e:
-        print("Gemini 요청 에러:", e)
-        return jsonify({"error": "Gemini request failed", "detail": str(e)}), 502
-    except (KeyError, IndexError, TypeError) as e:
-        print("Gemini 응답 파싱 에러:", e)
-        return jsonify({"error": "Invalid Gemini response", "detail": str(e)}), 502
     except Exception as e:
         print("에러:", e)
         return jsonify({"error": str(e)}), 500
