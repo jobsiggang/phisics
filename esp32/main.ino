@@ -38,7 +38,7 @@ const int RELAY_ON  = LOW;
 const int RELAY_OFF = HIGH;
 
 // ===== 타이머 =====
-const unsigned long SEND_INTERVAL_MS = 5UL * 60UL * 1000UL;  // 5분
+const unsigned long SEND_INTERVAL_MS = 3UL * 60UL * 1000UL;  // 3분
 unsigned long lastSendMs = 0;
 
 // ===== HTTP 통신 설정 =====
@@ -58,7 +58,19 @@ float   g_hum    = NAN;
 bool    g_fanOn  = false;
 bool    g_pumpOn = false;
 String  g_statusMsg = "부팅 중...";
+String  g_advice = "조언을 기다리는 중...";
 bool    g_sending   = false;
+
+// ===== OLED 페이지 제어 =====
+int     g_currentPage = 0;      // 0: 센서/모터, 1: 조언
+const int PAGE_COUNT = 2;
+unsigned long g_lastPageChangeMs = 0;
+const unsigned long PAGE_CHANGE_INTERVAL_MS = 5000;  // 5초마다 페이지 전환
+int g_adviceSubPage = 0;
+int g_advicePageCount = 1;
+
+const int ADVICE_CHARS_PER_LINE = 8;
+const int ADVICE_LINES_PER_PAGE = 2;
 
 // ============================================================
 //  유틸리티
@@ -100,6 +112,62 @@ bool ensureWiFi() {
   return false;
 }
 
+/** UTF-8 시작 바이트 기준 문자 길이 반환 */
+int utf8CharBytes(uint8_t c) {
+  if ((c & 0x80) == 0x00) return 1;
+  if ((c & 0xE0) == 0xC0) return 2;
+  if ((c & 0xF0) == 0xE0) return 3;
+  if ((c & 0xF8) == 0xF0) return 4;
+  return 1;
+}
+
+/** UTF-8 문자열의 문자 수(코드포인트 수) 계산 */
+int utf8Length(const String& s) {
+  int count = 0;
+  int i = 0;
+  while (i < s.length()) {
+    uint8_t c = (uint8_t)s[i];
+    i += utf8CharBytes(c);
+    count++;
+  }
+  return count;
+}
+
+/** UTF-8 문자열을 문자 단위로 잘라 반환 */
+String utf8Substring(const String& s, int startChar, int charCount) {
+  if (charCount <= 0) return "";
+
+  int i = 0;
+  int charIdx = 0;
+  int startByte = -1;
+  int endByte = s.length();
+
+  while (i < s.length()) {
+    if (charIdx == startChar) {
+      startByte = i;
+    }
+    if (charIdx == startChar + charCount) {
+      endByte = i;
+      break;
+    }
+
+    uint8_t c = (uint8_t)s[i];
+    i += utf8CharBytes(c);
+    charIdx++;
+  }
+
+  if (startByte < 0) return "";
+  return s.substring(startByte, endByte);
+}
+
+int calcAdvicePageCount(const String& advice) {
+  int totalChars = utf8Length(advice);
+  int charsPerPage = ADVICE_CHARS_PER_LINE * ADVICE_LINES_PER_PAGE;
+  if (charsPerPage <= 0) return 1;
+  int pages = (totalChars + charsPerPage - 1) / charsPerPage;
+  return max(1, pages);
+}
+
 // ============================================================
 //  모터 제어
 // ============================================================
@@ -122,10 +190,11 @@ void setPump(bool on) {
 
 /**
  * Gemini 응답 문자열에서 첫 번째 { } JSON 블록을 찾아
- * fan / pump 값을 파싱합니다.
+ * fan / pump / advice 값을 파싱합니다.
  * 파싱 성공 시 true 반환.
  */
-bool parseMotorJson(const String& text, bool& fanOn, bool& pumpOn) {
+bool parseMotorJson(const String& text, bool& fanOn, bool& pumpOn, String& advice) {
+  advice = "(조언 없음)";
   int start = text.indexOf('{');
   int end   = text.lastIndexOf('}');
   if (start < 0 || end <= start) return false;
@@ -175,45 +244,78 @@ bool parseMotorJson(const String& text, bool& fanOn, bool& pumpOn) {
       break;
     }
   }
+
+  // advice 파싱
+  if (doc.containsKey("advice")) {
+    advice = doc["advice"].as<String>();
+  }
+
   return true;
 }
 
 // ============================================================
-//  OLED 렌더링
+//  OLED 렌더링 — 페이지 기반
 // ============================================================
 
 void drawDisplay() {
   u8g2.clearBuffer();
 
-  // ── 제목 줄 ──
-  u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(0, 10, "Lavender Garden IoT");
-  u8g2.drawHLine(0, 12, 128);
-
-  // ── 센서 값 ──
-  char buf[32];
-  if (!isnan(g_temp) && !isnan(g_hum)) {
-    u8g2.setFont(u8g2_font_7x14B_tf);
-    snprintf(buf, sizeof(buf), "T:%.1f C  H:%.1f%%", g_temp, g_hum);
-    u8g2.drawStr(0, 30, buf);
-  } else {
+  if (g_currentPage == 0) {
+    // 페이지 0: 센서 값 & 모터 상태
     u8g2.setFont(u8g2_font_6x10_tf);
-    u8g2.drawStr(0, 28, "센서 읽기 중...");
+    u8g2.drawStr(0, 10, "Lavender Garden IoT");
+    u8g2.drawHLine(0, 12, 128);
+
+    char buf[32];
+    if (!isnan(g_temp) && !isnan(g_hum)) {
+      u8g2.setFont(u8g2_font_7x14B_tf);
+      snprintf(buf, sizeof(buf), "T:%.1f C  H:%.1f%%", g_temp, g_hum);
+      u8g2.drawStr(0, 30, buf);
+    } else {
+      u8g2.setFont(u8g2_font_unifont_t_korean2);
+      u8g2.setCursor(0, 30);
+      u8g2.print("센서 읽기 중...");
+    }
+
+    u8g2.setFont(u8g2_font_6x10_tf);
+    snprintf(buf, sizeof(buf), "Fan:%s  Pump:%s",
+             g_fanOn  ? "ON " : "OFF",
+             g_pumpOn ? "ON " : "OFF");
+    u8g2.drawStr(0, 46, buf);
+
+    u8g2.drawHLine(0, 50, 128);
+    u8g2.setFont(u8g2_font_unifont_t_korean2);
+    u8g2.setCursor(0, 62);
+    String msg = g_statusMsg;
+    u8g2.print(msg);
   }
+  else if (g_currentPage == 1) {
+    // 페이지 1: Gemini 조언
+    u8g2.setFont(u8g2_font_unifont_t_korean2);
+    u8g2.setCursor(0, 12);
+    u8g2.print("AI 조언");
+    u8g2.drawHLine(0, 12, 128);
 
-  // ── 모터 상태 ──
-  u8g2.setFont(u8g2_font_6x10_tf);
-  snprintf(buf, sizeof(buf), "Fan:%s  Pump:%s",
-           g_fanOn  ? "ON " : "OFF",
-           g_pumpOn ? "ON " : "OFF");
-  u8g2.drawStr(0, 46, buf);
+    String advice = g_advice;
+    g_advicePageCount = calcAdvicePageCount(advice);
+    if (g_adviceSubPage >= g_advicePageCount) g_adviceSubPage = 0;
 
-  // ── 상태 메시지 ──
-  u8g2.drawHLine(0, 50, 128);
-  // 상태 메시지는 최대 21자 (6px 폰트 기준)
-  String msg = g_statusMsg;
-  if (msg.length() > 21) msg = msg.substring(0, 21);
-  u8g2.drawStr(0, 62, msg.c_str());
+    u8g2.setFont(u8g2_font_unifont_t_korean2);
+    for (int line = 0; line < ADVICE_LINES_PER_PAGE; line++) {
+      int startChar = (g_adviceSubPage * ADVICE_LINES_PER_PAGE + line) * ADVICE_CHARS_PER_LINE;
+      String chunk = utf8Substring(advice, startChar, ADVICE_CHARS_PER_LINE);
+      if (chunk.length() == 0) break;
+      int y = 30 + (line * 16);
+      u8g2.setCursor(0, y);
+      u8g2.print(chunk);
+    }
+
+    u8g2.drawHLine(0, 50, 128);
+    u8g2.setFont(u8g2_font_6x10_tf);
+    char pageBuf[16];
+    snprintf(pageBuf, sizeof(pageBuf), "[%d/%d]", g_adviceSubPage + 1, g_advicePageCount);
+    u8g2.drawStr(95, 62, pageBuf);
+  }
 
   u8g2.sendBuffer();
 }
@@ -302,9 +404,15 @@ void sendSensorData() {
       String aiText = resDoc["result"].as<String>();
 
       bool fanOn = false, pumpOn = false;
-      if (parseMotorJson(aiText, fanOn, pumpOn)) {
+      String advice = "";
+      if (parseMotorJson(aiText, fanOn, pumpOn, advice)) {
         setFan(fanOn);
         setPump(pumpOn);
+        g_advice = advice;
+        g_adviceSubPage = 0;
+        g_advicePageCount = calcAdvicePageCount(g_advice);
+        g_currentPage = 0;
+        g_lastPageChangeMs = millis();
         g_statusMsg = String("AI OK F:") + (fanOn ? "ON" : "OF") +
                       " P:" + (pumpOn ? "ON" : "OF");
       } else {
@@ -353,6 +461,7 @@ void setup() {
   // OLED 시작
   Wire.begin();          // SDA=21, SCL=22 (ESP32 기본)
   u8g2.begin();
+  u8g2.enableUTF8Print();
   g_statusMsg = "WiFi 연결 중...";
   drawDisplay();
 
@@ -377,22 +486,38 @@ void loop() {
     ensureWiFi();
   }
 
-  // 5분 주기 전송
+  // 3분 주기 전송
   unsigned long now = millis();
   if (now - lastSendMs >= SEND_INTERVAL_MS) {
     lastSendMs = now;
     sendSensorData();
   }
 
-  // 남은 시간을 OLED 하단에 표시 (전송 중 아닐 때)
-  if (!g_sending) {
+  // 페이지 자동 전환 (5초 주기)
+  if (!g_sending && now - g_lastPageChangeMs >= PAGE_CHANGE_INTERVAL_MS) {
+    if (g_currentPage == 0) {
+      g_currentPage = 1;
+      g_adviceSubPage = 0;
+    } else {
+      if (g_adviceSubPage + 1 < g_advicePageCount) {
+        g_adviceSubPage++;
+      } else {
+        g_currentPage = 0;
+        g_adviceSubPage = 0;
+      }
+    }
+    g_lastPageChangeMs = now;
+  }
+
+  // 상태 메시지 갱신 (페이지 0일 때만)
+  if (!g_sending && g_currentPage == 0) {
     unsigned long remaining = SEND_INTERVAL_MS - (millis() - lastSendMs);
     unsigned int  secLeft   = remaining / 1000;
     char buf[24];
     snprintf(buf, sizeof(buf), "Next:%02u:%02u", secLeft / 60, secLeft % 60);
     g_statusMsg = String(buf);
-    drawDisplay();
   }
 
-  delay(5000);  // 5초마다 OLED 갱신
+  drawDisplay();
+  delay(1000);  // 1초마다 업데이트
 }

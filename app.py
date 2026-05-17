@@ -95,7 +95,7 @@ def sensor():
             "추가 설명/코드블록/개행 금지. "
             f"입력값: temperature={temp}, humidity={hum}. "
             "출력 스키마: {\"fan\":\"ON|OFF\",\"pump\":\"ON|OFF\",\"advice\":\"20자 이내\"}. "
-            "advice는 한국어 100자 이내로 작성하세요."
+            "advice는 한국어 20자 이내로 작성하세요."
         )
 
         result = ""
