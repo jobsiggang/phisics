@@ -19,6 +19,23 @@ _latest: dict = {}
 _latest_image: dict = {}
 
 
+def _has_api_key() -> bool:
+    return bool(API_KEY and API_KEY.strip())
+
+
+def _friendly_gemini_error(err) -> str:
+    msg = str(err or "").lower()
+    if "api_key_invalid" in msg or "api key not found" in msg:
+        return "Gemini API 키가 없거나 잘못되었습니다"
+    if "invalid_argument" in msg:
+        return "Gemini 요청 형식이 올바르지 않습니다"
+    if "429" in msg or "resource_exhausted" in msg or "rate" in msg:
+        return "Gemini 요청 한도를 초과했습니다"
+    if "timeout" in msg:
+        return "Gemini 응답 시간이 초과되었습니다"
+    return "Gemini 호출 실패"
+
+
 def _decide_motors(temp: float, hum: float) -> tuple[bool, bool]:
     # 간단한 안전 규칙: 고온이면 팬 ON, 저습이면 펌프 ON
     fan_on = temp >= 28.0
@@ -36,7 +53,7 @@ def _build_fallback_result(temp: float, hum: float, reason: str) -> str:
             "fan": "ON" if fan_on else "OFF",
             "pump": "ON" if pump_on else "OFF",
             "advice": advice,
-            "reason": reason[:80],
+            "reason": (reason or "Gemini 호출 실패")[:80],
         },
         ensure_ascii=False,
     )
@@ -134,13 +151,13 @@ def sensor():
         result = ""
         ai_error = None
 
-        if API_KEY:
+        if _has_api_key():
             try:
                 result = _call_gemini(prompt)
             except Exception as e:
-                ai_error = f"Gemini request failed: {e}"
+                ai_error = _friendly_gemini_error(e)
         else:
-            ai_error = "GEMINI_API_KEY is not set"
+            ai_error = "Gemini API 키가 설정되지 않았습니다"
 
         if not result:
             result = _build_fallback_result(float(temp), float(hum), ai_error or "unknown")
@@ -213,12 +230,15 @@ def analyze_image():
         body = request.get_json(silent=True) or {}
         question = body.get("question", "")
 
-        if not API_KEY:
-            return jsonify({"error": "GEMINI_API_KEY is not set"}), 500
+        if not _has_api_key():
+            return jsonify({"error": "Gemini API 키가 설정되지 않았습니다"}), 500
 
         image_bytes = base64.b64decode(_latest_image["image_b64"])
         prompt = _build_image_prompt(question, _latest.get("temperature"), _latest.get("humidity"))
-        result = _call_gemini_with_image(prompt, image_bytes, _latest_image["mime_type"])
+        try:
+            result = _call_gemini_with_image(prompt, image_bytes, _latest_image["mime_type"])
+        except Exception as e:
+            return jsonify({"error": _friendly_gemini_error(e)}), 500
 
         now_iso = datetime.now(timezone.utc).isoformat()
         _latest.update(
@@ -234,7 +254,7 @@ def analyze_image():
 
     except Exception as e:
         print("[analyze-image] 에러:", e)
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "이미지 분석 처리 중 서버 오류"}), 500
 
 
 if __name__ == "__main__":
